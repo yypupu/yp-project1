@@ -1,0 +1,1236 @@
+/**
+ * Y-PU プロジェクト運営アプリ　STEP3（全ページ）
+ * ログイン／自分のプロジェクト一覧／ホーム／ToDo／集客アタック／メンバー表（受付リンク）／
+ * 備品表／制作物・図面／資料／タイムテーブル（詳細・簡易）／アンケート分析／権限・連携
+ *
+ * データはすべて、このスクリプトが入っているスプレッドシート（マスター）に保存します。
+ * 公開設定：次のユーザーとして実行＝自分（Y-PU）、アクセスできるユーザー＝全員
+ * 画面との通信は fetch（doPost）で行うので、複数アカウントのブラウザでも動きます。
+ */
+
+const APP_NAME = 'Y-PU プロジェクト';
+const APP_VERSION = '2026.11.09';          // 画面側と合わせる。画面が古い／新しいを見分けるのに使う
+const SESSION_DAYS = 30;          // 一度ログインしたら何日ログインしたままにするか
+const CODE_MINUTES = 10;
+const CODE_PER_HOUR = 3;        // 同じアドレスにログインコードを送れるのは1時間にこの回数まで          // ログインコードの有効時間（分）
+const STAFF_KINDS = ['社員', 'インターン'];   // 全プロジェクトを見られる区分
+const PAGES = ['ホーム', 'ToDo', '集客アタック', 'メンバー表', 'アンケート分析', '備品表', '制作物・図面', '資料', 'タイムテーブル', '権限・連携'];
+const TODO_STATUS = ['未着手', '進行中', '完了'];
+const DEFAULT_CHOICES = {
+  'アタック区分': ['大学', 'ゼミ・授業', 'サークル', '個人', 'SNS', '企業', 'その他'],
+  '連絡手段': ['メール', '電話', 'LINE', '訪問', 'DM', '投稿'],
+  'アタックステータス': ['未連絡', '連絡済', '返信あり', '参加確定', 'NG'],
+  '参加状況': ['申込', '参加', '欠席', 'キャンセル'],
+  '当日参加': ['参加', '未定', '不参加'],
+  '備品区分': ['会社在庫', 'レンタル', '購入', '会場備品', '持参'],
+  '備品ステータス': ['未手配', '手配済', '確保済', '搬入済', '返却済'],
+  '制作物ステータス': ['未着手', 'ラフ', '確認中', '修正', 'OK', '入稿済'],
+  '資料状態': ['未着手', '作成中', '確認待ち', '確定'],
+  'タイテ色': ['グレー', '濃グレー', 'ゴールド', 'イエロー', '薄イエロー', 'ブルー', '白', '赤文字', 'プログラム枠'],
+  'PJ種別': ['自社イベント', '受託', '産官学', '学校連携'],
+  'PJ状態': ['準備中', '進行中', '終了'],
+  'PJ役割': ['社員（担当）', 'PL', '営業', '制作', '運営'],
+  'ユーザー区分': ['社員', 'インターン', 'メンバー']
+};
+const DEFAULT_TOOLS = { design: { name: 'Canva', url: 'https://www.canva.com/' }, submit: { name: '入稿先（印刷会社）', url: '' }, drawing: { name: '図面アプリ', url: '' } };
+let TZ_CACHE = '';
+/** 日付・時刻はスプレッドシートのタイムゾーンでそろえる（ずれ防止） */
+function tz_() {
+  if (!TZ_CACHE) { try { TZ_CACHE = ss_().getSpreadsheetTimeZone(); } catch (e) { TZ_CACHE = Session.getScriptTimeZone(); } }
+  return TZ_CACHE;
+}
+
+/* ====================================================================
+ * 表（シート）ごとの設定。key は画面とのやりとりに使う短い名前
+ * ==================================================================== */
+const TABLES = {
+  todo: {
+    dates: ['start', 'end'],
+    sheet: 'ToDo', prefix: 'T', page: 'ToDo', label: '小見出し', stamp: true,
+    fields: { group: '大見出し', status: 'ステータス', sub: '小見出し', memo: '内容・進捗メモ', start: '開始日', end: '締切日', who: '担当者', fb: 'FBメモ', by: '更新者', at: '更新日時' },
+    readonly: ['by', 'at'],
+    onAdd: function (o, me) { if (!o['ステータス']) o['ステータス'] = '未着手'; if (!o['担当者']) o['担当者'] = me.name; }
+  },
+  atk: {
+    dates: ['last', 'nextDate'],
+    sheet: 'アタック', prefix: 'A', page: '集客アタック', label: '相手', nums: ['est', 'fix'],
+    fields: { kind: '種類', cat: '区分', name: '相手', via: '連絡手段', who: '担当', status: 'ステータス', est: '見込み', fix: '確定', last: '最終連絡日', next: '次回アクション', nextDate: '期日', memo: 'メモ' },
+    onAdd: function (o, me) {
+      if (!o['種類']) o['種類'] = '学生'; if (!o['ステータス']) o['ステータス'] = '未連絡';
+      if (!o['担当']) o['担当'] = me.name; if (!('次回アクション' in o)) o['次回アクション'] = '初回連絡';
+    }
+  },
+  guest: {
+    sheet: '当日参加者', prefix: 'G', page: 'メンバー表', label: '氏名',
+    fields: { name: '氏名', univ: '大学', grade: '学年', status: '参加状況', recv: '受付', src: '追加元' },
+    onAdd: function (o) { if (!o['参加状況']) o['参加状況'] = '参加'; if (!o['追加元']) o['追加元'] = '当日追加'; }
+  },
+  staff: {
+    sheet: '運営メンバー', prefix: 'M', page: 'メンバー表', label: '氏名',
+    fields: { name: '氏名', univ: '大学', grade: '学年', team: '希望チーム', attend: '当日参加' }
+  },
+  equip: {
+    dates: ['ret'],
+    sheet: '備品', prefix: 'E', page: '備品表', label: '品名', nums: ['qty', 'cost'], bools: ['inC', 'outC'],
+    fields: { cat: '区分', name: '品名', qty: '数量', place: '保管場所・手配先', who: '担当', status: 'ステータス', cost: '費用', area: '使う場所', ret: '返却期限', memo: 'メモ', inC: '搬入', outC: '搬出' },
+    onAdd: function (o, me) {
+      if (!o['区分']) o['区分'] = '会社在庫'; if (!o['ステータス']) o['ステータス'] = '未手配';
+      if (!o['担当']) o['担当'] = me.name; if (!('搬入' in o)) o['搬入'] = 'FALSE'; if (!('搬出' in o)) o['搬出'] = 'FALSE';
+    }
+  },
+  work: {
+    dates: ['due'],
+    sheet: '制作物', prefix: 'W', page: '制作物・図面', label: '名前',
+    fields: { type: '種類', name: '名前', who: '担当', status: 'ステータス', due: '締切', url: '作業ファイルのURL' },
+    onAdd: function (o, me) { if (!o['ステータス']) o['ステータス'] = '未着手'; if (!o['担当']) o['担当'] = me.name; }
+  },
+  doc: {
+    dates: ['updated'],
+    sheet: '資料', prefix: 'D', page: '資料', label: '資料名',
+    fields: { name: '資料名', who: '担当', status: '状態', url: 'URL', updated: '最終更新' },
+    readonly: ['updated'],
+    onAdd: function (o, me) { if (!o['状態']) o['状態'] = '未着手'; if (!o['担当']) o['担当'] = me.name; }
+  },
+  block: {
+    sheet: 'タイテ枠', prefix: 'B', page: 'タイムテーブル', label: '文字', nums: ['c1', 'c2', 'fs'], times: ['s', 'e'],
+    fields: { s: '開始', e: '終了', c1: '開始列', c2: '終了列', text: '文字', st: '色', fs: '文字サイズ' },
+    onAdd: function (o) { if (!o['色']) o['色'] = '薄イエロー'; }
+  },
+  flow: {
+    sheet: '簡易タイテ', prefix: 'F', page: 'タイムテーブル', label: '内容', times: ['s'],
+    fields: { s: '開始', item: '内容', who: '担当', place: '場所', note: '備考' }
+  }
+};
+
+/* ========== 画面を返す ========== */
+function doGet(e) {
+  const names = ['Index', 'index', 'Index.html', 'index.html'];
+  let t = null;
+  for (let i = 0; i < names.length && !t; i++) {
+    try { t = HtmlService.createTemplateFromFile(names[i]); } catch (err) { /* 次の名前を試す */ }
+  }
+  if (!t) {
+    return HtmlService.createHtmlOutput(
+      '<div style="font-family:sans-serif;padding:24px;line-height:1.8">' +
+      '<h2>画面のファイルが見つかりません</h2>' +
+      '<p>Apps Script の左の「ファイル」に、名前が <b>Index.html</b> のファイルがあるか確認してください。</p>' +
+      '<p>直したあとは「デプロイ → デプロイを管理 → 鉛筆マーク → バージョン：新バージョン → デプロイ」で反映します。</p></div>'
+    ).setTitle(APP_NAME);
+  }
+  t.apiUrl = ScriptApp.getService().getUrl() || '';
+  t.guestKey = (e && e.parameter && e.parameter.guest) ? String(e.parameter.guest).replace(/[^0-9a-zA-Z]/g, '') : '';
+  return t.evaluate()
+    .setTitle(APP_NAME)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/* ========== 画面からの呼び出しの受付（fetch） ========== */
+const API = {
+  requestCode: requestCode, verifyCode: verifyCode, logout: logout,
+  getBoot: getBoot, getProject: getProject, sync: sync, saveRows: saveRows, deleteRows: deleteRows,
+  saveRow: saveRow, deleteRow: deleteRow, saveTTConfig: saveTTConfig,
+  shareCreate: shareCreate, shareStop: shareStop, importForm: importForm,
+  guestGet: guestGet, guestSave: guestSave,
+  getForms: getForms,
+  getAdmin: getAdmin, saveUser: saveUser, saveGroup: saveGroup, deleteGroup: deleteGroup,
+  savePjMember: savePjMember, removePjMember: removePjMember, saveProjectInfo: saveProjectInfo,
+  createProject: createProject, saveTools: saveTools, setAutoImport: setAutoImport
+};
+function doPost(e) {
+  let out;
+  try {
+    const req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    const f = API[req.fn];
+    if (!f) throw new Error('不明な操作です：' + req.fn);
+    out = { ok: true, result: f.apply(null, req.args || []) };
+  } catch (err) {
+    out = { ok: false, error: String((err && err.message) || err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ========== スプレッドシートのメニュー ========== */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Y-PUアプリ')
+    .addItem('初期チェック', 'setup')
+    .addItem('フォームの回答を今すぐ取り込む', 'syncAllForms')
+    .addItem('期限切れのログイン情報を掃除', 'cleanupSessions')
+    .addToUi();
+}
+
+/** 最初に1回実行する：必要なシートと列があるか確認し、許可を取る */
+function setup() {
+  const ss = SpreadsheetApp.getActive();
+  PropertiesService.getScriptProperties().setProperty('SS_ID', ss.getId());
+  const need = {
+    'ユーザー': ['メールアドレス', '名字', '名前', '区分', '有効／無効'],
+    '権限': ['グループ名', 'メールアドレス'].concat(PAGES),
+    'プロジェクト': ['PJ ID', '名前', 'クライアント', '種別', '本番日', '集客目標', '状態', '参加者申込フォームの回答シートURL', '運営メンバー申込フォームの回答シートURL', 'アンケートフォームの回答シートURL'],
+    'PJメンバー': ['PJ ID', 'メールアドレス', '役割'],
+    '共有リンク': ['PJ ID', '合言葉', '有効期限', '有効／停止'],
+    'タイテ設定': ['PJ ID', 'タイトル', 'ページ番号', '開始時刻', '終了時刻', '1時間の高さ', '基本の文字サイズ'],
+    'タイテ列': ['PJ ID', '順番', '列名', 'グループ', '幅'],
+    '変更ログ': ['日時', 'メールアドレス', 'シート', 'ID', '操作', '変更内容']
+  };
+  Object.keys(TABLES).forEach(function (k) {
+    const t = TABLES[k];
+    need[t.sheet] = ['ID', 'PJ ID'].concat(Object.keys(t.fields).map(function (f) { return t.fields[f]; }));
+  });
+  const problems = [], added = [];
+  Object.keys(need).forEach(function (name) {
+    let sh = ss.getSheetByName(name);
+    if (!sh) {
+      sh = ss.insertSheet(name);
+      sh.getRange(1, 1, 1, need[name].length).setValues([need[name]]).setFontWeight('bold').setBackground('#FFE699');
+      sh.setFrozenRows(1);
+      added.push('シートを作成：' + name);
+      return;
+    }
+    const last = Math.max(1, sh.getLastColumn());
+    const head = sh.getRange(1, 1, 1, last).getValues()[0].map(function (h) { return String(h).trim(); });
+    const miss = need[name].filter(function (h) { return head.indexOf(h) < 0; });
+    if (miss.length) {
+      const startCol = head.join('') === '' ? 1 : last + 1;
+      sh.getRange(1, startCol, 1, miss.length).setValues([miss]).setFontWeight('bold').setBackground('#FFE699');
+      added.push('「' + name + '」に列を追加：' + miss.join('、'));
+    }
+  });
+  MailApp.getRemainingDailyQuota();       // メール送信の許可
+  ScriptApp.getProjectTriggers();         // 自動取り込み（時間で動かす）の許可
+  if (ss.getSpreadsheetTimeZone() !== 'Asia/Tokyo') problems.push('スプレッドシートの「ファイル → 設定 → タイムゾーン」を「(GMT+09:00) 東京」にしてください（今：' + ss.getSpreadsheetTimeZone() + '）');
+  try { FormApp.getActiveForm(); } catch (e) { /* Googleフォームを読むための許可 */ }
+  const msg = (added.length ? '足りなかったものを自動で追加しました：\n' + added.join('\n') + '\n\n' : '') +
+    (problems.length ? '直してほしい点があります：\n' + problems.join('\n') : 'OK：必要なシートと列がそろっています。');
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) { Logger.log(msg); }
+}
+
+/* ========== シートの読み書き ========== */
+/* 速さのための工夫：
+ *  ・スプレッドシートは1回の呼び出しで1回だけ開く（SS_）
+ *  ・同じシートは1回の呼び出しで1回だけ読む（MEMO_）
+ *  ・ユーザー／権限などあまり変わらないシートは5分間キャッシュ（SHARED_）。手で編集したら onEdit で消す
+ *  ・データが変わったかは「版（ver）」で判断し、変わっていなければシートを読まない（sync） */
+let SS_ = null;
+const MEMO_ = {};
+const SHARED_ = ['ユーザー', '権限', 'PJメンバー', 'プロジェクト', '共有リンク', 'タイテ設定', 'タイテ列'];
+function ss_() {
+  if (SS_) return SS_;
+  const id = PropertiesService.getScriptProperties().getProperty('SS_ID');
+  SS_ = id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActive();
+  return SS_;
+}
+function cache_() { return CacheService.getScriptCache(); }
+/** シートを書き換えたら呼ぶ：キャッシュを消して「版」を進める */
+function invalidate_(name, pjId) {
+  delete MEMO_[name];
+  try {
+    const c = cache_();
+    c.remove('t:' + name);
+    if (name === '選択肢') c.remove('choices');
+    c.put('v:' + (pjId || '*'), String(Date.now()) + Math.random().toString(36).slice(2, 6), 21600);
+  } catch (e) { /* キャッシュが使えなくても動く */ }
+}
+/** 今のデータの版（全体の版＋プロジェクトの版） */
+function ver_(pjId) {
+  const c = cache_(), keys = ['v:*', 'v:' + pjId];
+  const got = c.getAll(keys);
+  keys.forEach(function (k) { if (!got[k]) { got[k] = String(Date.now()); c.put(k, got[k], 21600); } });
+  return got['v:*'] + '.' + got['v:' + pjId];
+}
+/** シートを手で編集したとき（スプレッドシート側）：キャッシュを消して、画面に「変わった」と知らせる */
+function onEdit(e) {
+  try {
+    const name = e.range.getSheet().getName();
+    const c = CacheService.getScriptCache();
+    c.removeAll(['t:' + name, 'choices']);
+    c.put('v:*', String(Date.now()), 21600);
+  } catch (err) { /* 何もしない */ }
+}
+
+/** セルの値を画面で扱いやすい形（文字）にそろえる */
+function norm_(v) {
+  if (v instanceof Date) {
+    if (v.getFullYear() < 1901) return Utilities.formatDate(v, tz_(), 'HH:mm');
+    const hm = Utilities.formatDate(v, tz_(), 'HH:mm');
+    return Utilities.formatDate(v, tz_(), hm === '00:00' ? 'yyyy-MM-dd' : 'yyyy-MM-dd HH:mm');
+  }
+  if (v === true) return 'TRUE';
+  if (v === false) return 'FALSE';
+  return v === null || v === undefined ? '' : v;
+}
+
+/** 画面から来た値をセルに入れる値にする（日付の形なら日付に、数は数に） */
+function toCell_(v) {
+  if (v instanceof Date || typeof v === 'number') return v;
+  const s = String(v === null || v === undefined ? '' : v);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return Utilities.parseDate(s, tz_(), 'yyyy-MM-dd');
+  return s;
+}
+/** 時刻は文字として保存する（シートの時刻のずれを防ぐため、先頭に ' を付ける） */
+function timeCell_(v) {
+  const m = String(v || '').match(/^(\d{1,2}):(\d{2})/);
+  return m ? "'" + String(m[1]).padStart(2, '0') + ':' + m[2] : '';
+}
+
+/** シートを「見出し名 → 値」のオブジェクトの配列として読む */
+function readTable_(name) {
+  if (MEMO_[name]) return MEMO_[name];
+  const shared = SHARED_.indexOf(name) >= 0;
+  if (shared) {
+    try { const hit = cache_().get('t:' + name); if (hit) { MEMO_[name] = JSON.parse(hit); return MEMO_[name]; } } catch (e) { /* 読み直す */ }
+  }
+  const out = readTableRaw_(name);
+  MEMO_[name] = out;
+  if (shared) { try { const j = JSON.stringify(out); if (j.length < 95000) cache_().put('t:' + name, j, 300); } catch (e) { /* 入らなければ毎回読む */ } }
+  return out;
+}
+function readTableRaw_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('シート「' + name + '」が見つかりません。');
+  return tableFromValues_(sh.getDataRange().getValues());
+}
+function tableFromValues_(data) {
+  const values = data.slice();
+  const head = values.shift().map(function (h) { return String(h).trim(); });
+  const out = [];
+  values.forEach(function (r, i) {
+    if (!r.some(function (c) { return c !== '' && c !== null; })) return;
+    const o = { _row: i + 2 };
+    head.forEach(function (h, j) { if (h) o[h] = norm_(r[j]); });
+    out.push(o);
+  });
+  return out;
+}
+function readTableSafe_(name) { try { return readTable_(name); } catch (e) { return []; } }
+
+/** 「選択肢」シートからプルダウンの候補を読む（なければ初期値） */
+function getChoices_() {
+  if (MEMO_['#choices']) return MEMO_['#choices'];
+  try { const hit = cache_().get('choices'); if (hit) return (MEMO_['#choices'] = JSON.parse(hit)); } catch (e) { /* 読み直す */ }
+  const out = getChoicesRaw_();
+  MEMO_['#choices'] = out;
+  try { cache_().put('choices', JSON.stringify(out), 300); } catch (e) { /* 何もしない */ }
+  return out;
+}
+function getChoicesRaw_() {
+  let v = [];
+  try { v = ss_().getSheetByName('選択肢').getDataRange().getValues(); } catch (e) { v = []; }
+  const head = v.length ? v[0].map(function (x) { return String(x).trim(); }) : [];
+  const out = {};
+  Object.keys(DEFAULT_CHOICES).forEach(function (k) {
+    const j = head.indexOf(k), list = [];
+    if (j >= 0) for (let i = 1; i < v.length; i++) { const s = String(v[i][j]).trim(); if (s) list.push(s); }
+    out[k] = list.length ? list : DEFAULT_CHOICES[k];
+  });
+  return out;
+}
+function getTools_() {
+  try { return Object.assign({}, DEFAULT_TOOLS, JSON.parse(PropertiesService.getScriptProperties().getProperty('TOOLS') || '{}')); }
+  catch (e) { return DEFAULT_TOOLS; }
+}
+
+function nextId_(data, idCol, prefix) {
+  let max = 0;
+  for (let i = 1; i < data.length; i++) {
+    const m = String(data[i][idCol]).match(/(\d+)$/);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return prefix + String(max + 1).padStart(4, '0');
+}
+function headOf_(data) { return data[0].map(function (h) { return String(h).trim(); }); }
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+function sheet_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('シート「' + name + '」が見つかりません。');
+  return sh;
+}
+function diff_(head, before, row, skip) {
+  const changes = [];
+  head.forEach(function (h, j) {
+    if (skip.indexOf(h) >= 0) return;
+    const a = before ? String(norm_(before[j])).replace(/^'/, '') : '';
+    const b = String(norm_(row[j])).replace(/^'/, '');
+    if (a !== b) changes.push(h + '：' + (a || '（空）') + '→' + (b || '（空）'));
+  });
+  return changes;
+}
+
+/** IDで1行を追加・更新する（同時保存は順番待ち） */
+function upsert_(sheetName, id, obj, prefix, me, pjId) {
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const idCol = head.indexOf('ID'), pjCol = head.indexOf('PJ ID');
+    let r = -1;
+    if (id) {
+      for (let i = 1; i < data.length; i++) { if (String(data[i][idCol]) === String(id)) { r = i; break; } }
+      if (r < 0) throw new Error('この行が見つかりませんでした。ほかの人が削除した可能性があります。画面を更新してください。');
+      if (String(data[r][pjCol]) !== String(pjId)) throw new Error('別のプロジェクトの行は編集できません。');
+    }
+    const newId = id || nextId_(data, idCol, prefix);
+    obj['ID'] = newId;
+    const before = r >= 0 ? data[r] : null;
+    const row = head.map(function (h, j) { return (h in obj) ? toCell_(obj[h]) : (before ? before[j] : ''); });
+    const changes = diff_(head, before, row, ['ID', 'PJ ID', '更新者', '更新日時'].concat(head.filter(function (h) { return !(h in obj); })));
+    if (r >= 0) sh.getRange(r + 1, 1, 1, head.length).setValues([row]);
+    else sh.getRange(data.length + 1, 1, 1, head.length).setValues([row]);
+    if (r < 0 || changes.length) log_(me, sheetName, newId, r >= 0 ? '更新' : '追加', changes.join(' ／ '));
+    invalidate_(sheetName, pjId);
+    return newId;
+  });
+}
+
+/**
+ * まとめて追加・更新する（貼り付け・一括変更・ふつうの保存すべて）
+ * list: [{ id: 既存ならID／新規なら空, obj: {見出し: 値} }]  → 戻り値：IDの配列（list と同じ順）
+ */
+function upsertMany_(sheetName, list, prefix, me, pjId) {
+  if (!list.length) return [];
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const idCol = head.indexOf('ID'), pjCol = head.indexOf('PJ ID');
+    const index = {};
+    let max = 0;
+    for (let i = 1; i < data.length; i++) {
+      const id = String(data[i][idCol]);
+      if (id) index[id] = i;
+      const m = id.match(/(\d+)$/); if (m) max = Math.max(max, Number(m[1]));
+    }
+    const ids = [], adds = [], upd = {}, logs = [];
+    list.forEach(function (it) {
+      let r = -1;
+      if (it.id) {
+        r = index[String(it.id)];
+        if (r === undefined) throw new Error('行が見つかりませんでした。ほかの人が削除した可能性があります。画面を更新してください。');
+        if (String(data[r][pjCol]) !== String(pjId)) throw new Error('別のプロジェクトの行は編集できません。');
+      }
+      const newId = it.id || prefix + String(++max).padStart(4, '0');
+      it.obj['ID'] = newId;
+      const before = r >= 0 ? data[r] : null;
+      const row = head.map(function (h, j) { return (h in it.obj) ? toCell_(it.obj[h]) : (before ? before[j] : ''); });
+      const changes = diff_(head, before, row, ['ID', 'PJ ID', '更新者', '更新日時'].concat(head.filter(function (h) { return !(h in it.obj); })));
+      if (r >= 0) { data[r] = row; upd[r] = true; } else { adds.push(row); index[newId] = -1; }
+      if (r < 0 || changes.length) logs.push([new Date(), me.email, sheetName, newId, r >= 0 ? '更新' : '追加', changes.join(' ／ ').slice(0, 500)]);
+      ids.push(newId);
+    });
+    const rows = Object.keys(upd).map(Number).sort(function (a, b) { return a - b; });
+    // 近い行はまとめて1回で書く（書く回数を減らす）
+    let k = 0;
+    while (k < rows.length) {
+      let e = k;
+      while (e + 1 < rows.length && rows[e + 1] - rows[e] <= 3) e++;
+      const lo = rows[k], hi = rows[e];
+      sh.getRange(lo + 1, 1, hi - lo + 1, head.length).setValues(data.slice(lo, hi + 1));
+      k = e + 1;
+    }
+    if (adds.length) sh.getRange(data.length + 1, 1, adds.length, head.length).setValues(adds);
+    logMany_(logs);
+    invalidate_(sheetName, pjId);
+    MEMO_[sheetName] = tableFromValues_(data.concat(adds));
+    return ids;
+  });
+}
+
+/** まとめて削除する */
+function removeMany_(sheetName, ids, me, pjId, labelCol) {
+  if (!ids.length) return 0;
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const idCol = head.indexOf('ID'), pjCol = head.indexOf('PJ ID'), lc = head.indexOf(labelCol);
+    const want = {}; ids.forEach(function (id) { want[String(id)] = true; });
+    const hit = [], logs = [];
+    for (let i = 1; i < data.length; i++) {
+      if (!want[String(data[i][idCol])]) continue;
+      if (String(data[i][pjCol]) !== String(pjId)) throw new Error('別のプロジェクトの行は削除できません。');
+      hit.push(i);
+      logs.push([new Date(), me.email, sheetName, String(data[i][idCol]), '削除', lc >= 0 ? String(data[i][lc]).slice(0, 500) : '']);
+    }
+    // 下の行から、続いている行はまとめて消す
+    const left = data.filter(function (r, i) { return i === 0 || hit.indexOf(i) < 0; });
+    let k = hit.length - 1;
+    while (k >= 0) {
+      let s = k;
+      while (s - 1 >= 0 && hit[s - 1] === hit[s] - 1) s--;
+      sh.deleteRows(hit[s] + 1, hit[k] - hit[s] + 1);
+      k = s - 1;
+    }
+    logMany_(logs);
+    invalidate_(sheetName, pjId);
+    MEMO_[sheetName] = tableFromValues_(left);
+    return hit.length;
+  });
+}
+
+/** IDで1行を削除する */
+function remove_(sheetName, id, me, pjId, labelCol) {
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const idCol = head.indexOf('ID'), pjCol = head.indexOf('PJ ID'), lc = head.indexOf(labelCol);
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][idCol]) === String(id)) {
+        if (String(data[i][pjCol]) !== String(pjId)) throw new Error('別のプロジェクトの行は削除できません。');
+        sh.deleteRow(i + 1);
+        log_(me, sheetName, id, '削除', lc >= 0 ? String(data[i][lc]) : '');
+        invalidate_(sheetName, pjId);
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+/** まとめて追加する（フォームの取り込み用） */
+function appendMany_(sheetName, objs, prefix, me, note) {
+  if (!objs.length) return 0;
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const idCol = head.indexOf('ID');
+    let max = 0;
+    for (let i = 1; i < data.length; i++) { const m = String(data[i][idCol]).match(/(\d+)$/); if (m) max = Math.max(max, Number(m[1])); }
+    const rows = objs.map(function (o) {
+      o['ID'] = prefix + String(++max).padStart(4, '0');
+      return head.map(function (h) { return (h in o) ? toCell_(o[h]) : ''; });
+    });
+    sh.getRange(data.length + 1, 1, rows.length, head.length).setValues(rows);
+    log_(me, sheetName, '', '追加', note || (rows.length + '件を追加'));
+    invalidate_(sheetName, objs[0] && objs[0]['PJ ID']);
+    return rows.length;
+  });
+}
+
+/** キー（列の値）で1行を追加・更新する（ユーザー・権限・PJメンバー・プロジェクト用） */
+function upsertBy_(sheetName, key, obj, me) {
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const kcols = Object.keys(key).map(function (k) { return head.indexOf(k); });
+    let r = -1;
+    for (let i = 1; i < data.length && r < 0; i++) {
+      if (Object.keys(key).every(function (k, n) { return String(norm_(data[i][kcols[n]])).trim().toLowerCase() === String(key[k]).trim().toLowerCase(); })) r = i;
+    }
+    const before = r >= 0 ? data[r] : null;
+    const row = head.map(function (h, j) { return (h in obj) ? toCell_(obj[h]) : (before ? before[j] : ''); });
+    const changes = diff_(head, before, row, head.filter(function (h) { return !(h in obj); }));
+    if (r >= 0) sh.getRange(r + 1, 1, 1, head.length).setValues([row]);
+    else sh.getRange(data.length + 1, 1, 1, head.length).setValues([row]);
+    if (r < 0 || changes.length) log_(me, sheetName, Object.keys(key).map(function (k) { return key[k]; }).join(' / '), r >= 0 ? '更新' : '追加', changes.join(' ／ '));
+    invalidate_(sheetName, null);
+    return true;
+  });
+}
+function removeBy_(sheetName, key, me) {
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    const data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    for (let i = data.length - 1; i >= 1; i--) {
+      if (Object.keys(key).every(function (k) { return String(norm_(data[i][head.indexOf(k)])).trim().toLowerCase() === String(key[k]).trim().toLowerCase(); })) {
+        sh.deleteRow(i + 1);
+        log_(me, sheetName, Object.keys(key).map(function (k) { return key[k]; }).join(' / '), '削除', '');
+      }
+    }
+    invalidate_(sheetName, null);
+    return true;
+  });
+}
+
+/** あるプロジェクトの行を全部入れ替える（タイテ設定・タイテ列・共有リンク用） */
+function replaceRows_(sheetName, pjId, objs, me) {
+  return withLock_(function () {
+    const sh = sheet_(sheetName);
+    let data = sh.getDataRange().getValues();
+    const head = headOf_(data);
+    const pjCol = head.indexOf('PJ ID');
+    for (let i = data.length - 1; i >= 1; i--) { if (String(data[i][pjCol]) === String(pjId)) sh.deleteRow(i + 1); }
+    if (objs.length) {
+      const start = sh.getLastRow() + 1;
+      const rows = objs.map(function (o) { o['PJ ID'] = pjId; return head.map(function (h) { return (h in o) ? toCell_(o[h]) : ''; }); });
+      sh.getRange(start, 1, rows.length, head.length).setValues(rows);
+    }
+    log_(me, sheetName, pjId, '更新', objs.length + '行に入れ替え');
+    invalidate_(sheetName, pjId);
+    return true;
+  });
+}
+
+function log_(me, sheet, id, op, text) {
+  logMany_([[new Date(), me.email, sheet, id, op, String(text || '').slice(0, 500)]]);
+}
+function logMany_(rows) {
+  if (!rows.length) return;
+  const sh = ss_().getSheetByName('変更ログ');
+  if (sh) sh.getRange(sh.getLastRow() + 1, 1, rows.length, 6).setValues(rows);
+}
+
+/* ========== ログイン ========== */
+function findUser_(email) {
+  email = String(email || '').trim().toLowerCase();
+  return readTable_('ユーザー').find(function (u) { return String(u['メールアドレス']).trim().toLowerCase() === email; }) || null;
+}
+
+function requestCode(email) {
+  email = String(email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { ok: false, msg: 'メールアドレスの形を確認してください。' };
+  const u = findUser_(email);
+  if (!u) return { ok: false, msg: 'このメールアドレスは登録されていません。管理者に「ユーザー」シートへの登録を頼んでください。' };
+  if (u['有効／無効'] === '無効') return { ok: false, msg: 'このアカウントは無効になっています。管理者に確認してください。' };
+  const cache = CacheService.getScriptCache();
+  if (cache.get('wait:' + email)) return { ok: false, msg: 'さっきコードを送りました。メールを確認するか、1分ほど待ってからもう一度押してください。' };
+  // 同じアドレスへの送信は1時間に CODE_PER_HOUR 回まで（いたずらでメールの上限を使い切られないように）
+  const now = Date.now();
+  let sent = [];
+  try { sent = JSON.parse(cache.get('rate:' + email) || '[]'); } catch (e) { sent = []; }
+  sent = sent.filter(function (t) { return now - t < 3600000; });
+  if (sent.length >= CODE_PER_HOUR) {
+    const mins = Math.max(1, Math.ceil((sent[0] + 3600000 - now) / 60000));
+    return { ok: false, msg: 'このメールアドレスへのコードの送信は、1時間に' + CODE_PER_HOUR + '回までです。あと' + mins + '分ほどで送れるようになります。届いたメール（迷惑メールフォルダも）をもう一度確認してください。' };
+  }
+  sent.push(now);
+  cache.put('rate:' + email, JSON.stringify(sent), 3600);
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  cache.put('code:' + email, code, CODE_MINUTES * 60);
+  cache.put('try:' + email, '0', CODE_MINUTES * 60);
+  cache.put('wait:' + email, '1', 60);
+  MailApp.sendEmail({
+    to: email,
+    subject: '【' + APP_NAME + '】ログインコード ' + code,
+    body: u['名字'] + 'さん\n\nログインコード：' + code + '\n\n' + CODE_MINUTES + '分以内にアプリの画面に入力してください。\n心当たりがない場合は、このメールを無視してください。\n\n' + APP_NAME
+  });
+  return { ok: true };
+}
+
+function verifyCode(email, code) {
+  email = String(email || '').trim().toLowerCase();
+  code = String(code || '').replace(/\D/g, '');
+  const cache = CacheService.getScriptCache();
+  const right = cache.get('code:' + email);
+  if (!right) return { ok: false, msg: 'コードの期限が切れました。もう一度コードを送ってください。' };
+  const tries = Number(cache.get('try:' + email) || 0) + 1;
+  if (tries > 5) { cache.remove('code:' + email); return { ok: false, msg: '間違いが続いたので、コードを無効にしました。もう一度コードを送ってください。' }; }
+  cache.put('try:' + email, String(tries), CODE_MINUTES * 60);
+  if (code !== right) return { ok: false, msg: 'コードが違います。メールに書かれた6桁の数字を確認してください。' };
+  cache.remove('code:' + email);
+  const token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  PropertiesService.getScriptProperties().setProperty('s:' + token, JSON.stringify({ email: email, exp: Date.now() + SESSION_DAYS * 86400000 }));
+  return { ok: true, token: token };
+}
+
+function me_(token) {
+  if (!token) throw new Error('LOGIN');
+  if (MEMO_['#me:' + token]) return MEMO_['#me:' + token];
+  try { const hit = cache_().get('me:' + token); if (hit) return (MEMO_['#me:' + token] = JSON.parse(hit)); } catch (e) { /* 読み直す */ }
+  const me = meRaw_(token);
+  MEMO_['#me:' + token] = me;
+  try { cache_().put('me:' + token, JSON.stringify(me), 120); } catch (e) { /* 何もしない */ }
+  return me;
+}
+function meRaw_(token) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty('s:' + token);
+  if (!raw) throw new Error('LOGIN');
+  const s = JSON.parse(raw);
+  if (s.exp < Date.now()) { props.deleteProperty('s:' + token); throw new Error('LOGIN'); }
+  const u = findUser_(s.email);
+  if (!u || u['有効／無効'] === '無効') throw new Error('LOGIN');
+  const kind = String(u['区分'] || '');
+  return { email: s.email, name: String(u['名字'] || ''), given: String(u['名前'] || ''), kind: kind, staff: STAFF_KINDS.indexOf(kind) >= 0 };
+}
+
+function logout(token) {
+  if (token) { PropertiesService.getScriptProperties().deleteProperty('s:' + token); try { cache_().remove('me:' + token); } catch (e) { /* 何もしない */ } }
+  return true;
+}
+
+function cleanupSessions() {
+  const p = PropertiesService.getScriptProperties();
+  const all = p.getProperties();
+  Object.keys(all).forEach(function (k) {
+    if (k.indexOf('s:') !== 0) return;
+    try { if (JSON.parse(all[k]).exp < Date.now()) p.deleteProperty(k); } catch (e) { p.deleteProperty(k); }
+  });
+}
+
+/* ========== 権限・プロジェクト ========== */
+function pagesFor_(email) {
+  const set = {};
+  readTable_('権限').forEach(function (g) {
+    const mails = String(g['メールアドレス'] || '').toLowerCase().split(/[\s,、]+/).filter(String);
+    if (mails.indexOf(email) < 0) return;
+    PAGES.forEach(function (p) { if (String(g[p]).toUpperCase() === 'TRUE') set[p] = true; });
+  });
+  set['ホーム'] = true;
+  return PAGES.filter(function (p) { return set[p]; });
+}
+
+function myRoles_(me) {
+  const m = {};
+  readTable_('PJメンバー').forEach(function (r) {
+    if (String(r['メールアドレス']).trim().toLowerCase() === me.email) m[String(r['PJ ID'])] = String(r['役割'] || '');
+  });
+  return m;
+}
+
+/** プロジェクトとページを使ってよいか確かめる */
+function check_(token, pjId, page) {
+  const me = me_(token);
+  const roles = myRoles_(me);
+  if (!me.staff && !roles[pjId]) throw new Error('このプロジェクトのメンバーではありません。');
+  const pages = pagesFor_(me.email);
+  if (page && pages.indexOf(page) < 0) throw new Error('「' + page + '」を使う権限がありません。');
+  return { me: me, roles: roles, pages: pages };
+}
+
+function today_() { return Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd'); }
+function addDays_(n) { const d = new Date(); d.setDate(d.getDate() + n); return Utilities.formatDate(d, tz_(), 'yyyy-MM-dd'); }
+/** いろいろな書き方の日付を 2026-11-03 の形にそろえる（読めなければそのまま） */
+function dateStr_(v) {
+  const s = String(v === null || v === undefined ? '' : v).replace(/^'/, '').trim();
+  if (!s) return '';
+  let m = s.match(/^(\d{4})\s*[-\/.年]\s*(\d{1,2})\s*[-\/.月]\s*(\d{1,2})/);
+  if (m) return m[1] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+  m = s.match(/^(\d{1,2})\s*[\/月]\s*(\d{1,2})\s*日?\s*(?:[(（].*)?$/);
+  if (m) {
+    const t = today_().split('-').map(Number);
+    let y = t[0];
+    const diff = (Date.UTC(y, +m[1] - 1, +m[2]) - Date.UTC(t[0], t[1] - 1, t[2])) / 86400000;
+    if (diff < -180) y++;
+    return y + '-' + String(m[1]).padStart(2, '0') + '-' + String(m[2]).padStart(2, '0');
+  }
+  return s;
+}
+function daysLeft_(s) {
+  s = dateStr_(s);
+  if (!s) return null;
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const t = today_().split('-').map(Number);
+  return Math.round((Date.UTC(+m[1], +m[2] - 1, +m[3]) - Date.UTC(t[0], t[1] - 1, t[2])) / 86400000);
+}
+function whoIncludes_(who, name) {
+  return String(who || '').split(/[,、\s]+/).some(function (x) { return x === name || x === 'ALL'; });
+}
+function normName_(s) { return String(s || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase(); }
+
+/** 表の1行を画面用の形にする */
+function clean_(key, r) {
+  const t = TABLES[key];
+  const o = { id: String(r['ID'] || '') };
+  Object.keys(t.fields).forEach(function (k) {
+    let v = r[t.fields[k]];
+    v = (v === undefined || v === null) ? '' : v;
+    if ((t.nums || []).indexOf(k) >= 0) o[k] = v === '' ? '' : (Number(v) || 0);
+    else if ((t.bools || []).indexOf(k) >= 0) o[k] = String(v).toUpperCase() === 'TRUE';
+    else if ((t.dates || []).indexOf(k) >= 0) o[k] = dateStr_(v);
+    else o[k] = String(v).replace(/^'/, '');
+  });
+  return o;
+}
+function rowsFor_(key, pjId) {
+  return readTableSafe_(TABLES[key].sheet).filter(function (r) { return String(r['PJ ID']) === pjId; }).map(function (r) { return clean_(key, r); });
+}
+function pjNames_(projects) { const m = {}; projects.forEach(function (x) { m[String(x['PJ ID'])] = String(x['名前'] || ''); }); return m; }
+function attacksWithOthers_(pjId, projects) {
+  const names = pjNames_(projects);
+  const all = readTableSafe_('アタック');
+  const byName = {};
+  all.forEach(function (a) {
+    const k = normName_(a['相手']); if (!k) return;
+    (byName[k] = byName[k] || []).push({ pj: String(a['PJ ID']), pjName: names[String(a['PJ ID'])] || String(a['PJ ID']), who: String(a['担当'] || ''), status: String(a['ステータス'] || '') });
+  });
+  return all.filter(function (a) { return String(a['PJ ID']) === pjId; }).map(function (a) {
+    const o = clean_('atk', a);
+    o.others = (byName[normName_(o.name)] || []).filter(function (x) { return x.pj !== pjId; });
+    return o;
+  });
+}
+function shareInfo_(pjId) {
+  const r = readTableSafe_('共有リンク').filter(function (x) { return String(x['PJ ID']) === pjId; })[0];
+  if (!r) return null;
+  return { key: String(r['合言葉'] || ''), exp: dateStr_(r['有効期限']), state: String(r['有効／停止'] || '') };
+}
+function ttConfig_(pjId) {
+  const s = readTableSafe_('タイテ設定').filter(function (x) { return String(x['PJ ID']) === pjId; })[0] || {};
+  let cols = readTableSafe_('タイテ列').filter(function (x) { return String(x['PJ ID']) === pjId; })
+    .map(function (c) { return { order: Number(c['順番']) || 0, name: String(c['列名'] || ''), group: String(c['グループ'] || ''), w: Number(c['幅']) || 80 }; })
+    .sort(function (a, b) { return a.order - b.order; });
+  if (!cols.length) cols = [{ order: 1, name: '全体', group: '全体', w: 100 }, { order: 2, name: '運営', group: '運営', w: 100 }, { order: 3, name: '参加者', group: '参加者', w: 100 }];
+  const t = function (v, d) { const m = String(v || '').replace(/^'/, '').match(/^(\d{1,2}):(\d{2})/); return m ? String(m[1]).padStart(2, '0') + ':' + m[2] : d; };
+  return {
+    title: String(s['タイトル'] || 'タイムテーブル'), page: String(s['ページ番号'] || ''),
+    start: t(s['開始時刻'], '09:00'), end: t(s['終了時刻'], '19:00'),
+    hourH: Number(s['1時間の高さ']) || 56, font: Number(s['基本の文字サイズ']) || 10, cols: cols
+  };
+}
+
+function summarize_(todos, atks, me) {
+  const mine = todos.filter(function (t) { return t.status !== '完了' && whoIncludes_(t.who, me.name); });
+  const late = mine.filter(function (t) { const n = daysLeft_(t.end); return n !== null && n < 0; }).length;
+  const done = todos.filter(function (t) { return t.status === '完了'; }).length;
+  const next = mine.filter(function (t) { return t.end; }).sort(function (a, b) { return a.end.localeCompare(b.end); })[0];
+  const myAtk = atks.filter(function (a) { return a.who === me.name && ['参加確定', 'NG'].indexOf(a.status) < 0; }).length;
+  return { myOpen: mine.length, myLate: late, total: todos.length, done: done, myAtk: myAtk, next: next ? { date: next.end, title: next.sub || next.group } : null };
+}
+
+/* ========== 画面から呼ばれる関数 ========== */
+
+/** TOP：自分のプロジェクト一覧 */
+function getBoot(token) {
+  const me = me_(token);
+  const roles = myRoles_(me);
+  const todos = readTableSafe_('ToDo').map(function (t) { return Object.assign(clean_('todo', t), { pj: String(t['PJ ID']) }); });
+  const atks = readTableSafe_('アタック').map(function (a) { return Object.assign(clean_('atk', a), { pj: String(a['PJ ID']) }); });
+  const list = readTable_('プロジェクト').filter(function (p) { return p['状態'] !== '終了' && p['PJ ID']; }).map(function (p) {
+    const id = String(p['PJ ID']);
+    return {
+      id: id, name: String(p['名前'] || ''), client: String(p['クライアント'] || ''), kind: String(p['種別'] || ''),
+      date: dateStr_(p['本番日']), days: daysLeft_(p['本番日']), target: p['集客目標'], role: roles[id] || '',
+      summary: summarize_(todos.filter(function (t) { return t.pj === id; }), atks.filter(function (a) { return a.pj === id; }), me)
+    };
+  }).sort(function (a, b) { return (a.date || '9999').localeCompare(b.date || '9999'); });
+  return {
+    sv: APP_VERSION, me: me, pages: pagesFor_(me.email),
+    mine: list.filter(function (p) { return p.role; }),
+    others: me.staff ? list.filter(function (p) { return !p.role; }) : [],
+    at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss')
+  };
+}
+
+/**
+ * プロジェクトのデータ。parts で必要な部分だけ返す
+ * todo / atk / guest / staff / share / equip / work / doc / ttcfg / block / flow
+ */
+function getProject(token, pjId, parts) {
+  pjId = String(pjId);
+  const c = check_(token, pjId, null);
+  const me = c.me, pages = c.pages;
+  const projects = readTable_('プロジェクト');
+  const p = projects.find(function (x) { return String(x['PJ ID']) === pjId; });
+  if (!p) throw new Error('プロジェクトが見つかりません。');
+  parts = (parts && parts.length) ? parts : ['todo', 'atk'];
+  const ver = ver_(pjId);
+  const want = function (k, page) { return parts.indexOf(k) >= 0 && pages.indexOf(page) >= 0; };
+  const out = {};
+  if (want('todo', 'ToDo')) out.todo = rowsFor_('todo', pjId);
+  if (want('atk', '集客アタック')) out.atk = attacksWithOthers_(pjId, projects);
+  if (want('guest', 'メンバー表')) out.guest = rowsFor_('guest', pjId);
+  if (want('staff', 'メンバー表')) out.staff = rowsFor_('staff', pjId);
+  if (want('share', 'メンバー表')) out.share = shareInfo_(pjId);
+  if (want('equip', '備品表')) out.equip = rowsFor_('equip', pjId);
+  if (want('work', '制作物・図面')) out.work = rowsFor_('work', pjId);
+  if (want('doc', '資料')) out.doc = rowsFor_('doc', pjId);
+  if (want('ttcfg', 'タイムテーブル')) out.ttcfg = ttConfig_(pjId);
+  if (want('block', 'タイムテーブル')) out.block = rowsFor_('block', pjId);
+  if (want('flow', 'タイムテーブル')) out.flow = rowsFor_('flow', pjId);
+  return {
+    me: me, pages: pages,
+    project: {
+      id: pjId, name: String(p['名前'] || ''), client: String(p['クライアント'] || ''), kind: String(p['種別'] || ''),
+      date: dateStr_(p['本番日']), days: daysLeft_(p['本番日']), target: Number(p['集客目標']) || 0,
+      role: c.roles[pjId] || (me.staff ? me.kind : '')
+    },
+    parts: out, choices: getChoices_(), tools: getTools_(), ver: ver, sv: APP_VERSION,
+    today: today_(), at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss')
+  };
+}
+
+/**
+ * 30秒ごとの確認用。画面が持っている版（ver）が今と同じなら、シートを読まずに { same: true } だけ返す
+ */
+function sync(token, pjId, parts, ver) {
+  pjId = String(pjId);
+  check_(token, pjId, null);
+  const now = ver_(pjId);
+  if (ver && ver === now) return { same: true, sv: APP_VERSION, ver: now, at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss') };
+  return getProject(token, pjId, parts);
+}
+
+/** 画面から来た1行分を、シートの見出し名のオブジェクトにする */
+function buildObj_(t, key, item, me, pjId) {
+  const obj = { 'PJ ID': pjId };
+  Object.keys(t.fields).forEach(function (k) {
+    if (!(k in item) || (t.readonly || []).indexOf(k) >= 0) return;
+    let v = item[k];
+    if ((t.nums || []).indexOf(k) >= 0) v = (v === '' || v === null) ? '' : Math.max(0, Math.round(Number(String(v).replace(/[,，¥￥円\s]/g, '')) || 0));
+    else if ((t.bools || []).indexOf(k) >= 0) v = (v === true || /^(TRUE|済|○|◯|✓|✔|1|はい|yes)$/i.test(String(v).trim())) ? 'TRUE' : 'FALSE';
+    else if ((t.times || []).indexOf(k) >= 0) v = timeCell_(v);
+    else if ((t.dates || []).indexOf(k) >= 0) v = dateStr_(v);
+    else v = String(v === null || v === undefined ? '' : v);
+    obj[t.fields[k]] = v;
+  });
+  if (t.stamp) { obj['更新者'] = me.email; obj['更新日時'] = new Date(); }
+  if (key === 'doc') obj['最終更新'] = today_();
+  if (key === 'todo' && ('ステータス' in obj) && obj['ステータス'] && TODO_STATUS.indexOf(obj['ステータス']) < 0) delete obj['ステータス'];
+  if (!item.id && t.onAdd) t.onAdd(obj, me, pjId);
+  return obj;
+}
+
+/**
+ * まとめて保存（画面のふつうの保存・貼り付け・一括変更すべてこれ）
+ * items: [{ id?: 既存のID, ...項目 }]。新しい行は id なし（順番どおりに ids が返る）
+ * 戻り値：{ key, ids, rows: その表の最新の全行, ver }
+ */
+function saveRows(token, pjId, key, items, force) {
+  pjId = String(pjId);
+  const t = TABLES[key];
+  if (!t) throw new Error('不明な表です：' + key);
+  const me = check_(token, pjId, t.page).me;
+  items = (items || []).slice(0, 1000);
+  if (key === 'atk') {
+    items.forEach(function (it) { if (!it.id && !String(it.name || '').trim()) throw new Error('相手の名前を入力してください。'); });
+    if (!force && items.length === 1 && !items[0].id) {
+      const name = String(items[0].name).trim();
+      const dup = findDup_(name, pjId);
+      if (dup.length) return { dup: { name: name, hits: dup } };
+    }
+  }
+  const list = items.map(function (it) { return { id: it.id || '', obj: buildObj_(t, key, it, me, pjId) }; });
+  const ids = upsertMany_(t.sheet, list, t.prefix, me, pjId);
+  return {
+    key: key, ids: ids, ver: ver_(pjId), sv: APP_VERSION,
+    rows: key === 'atk' ? attacksWithOthers_(pjId, readTable_('プロジェクト')) : rowsFor_(key, pjId),
+    at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss')
+  };
+}
+/** まとめて削除 */
+function deleteRows(token, pjId, key, ids) {
+  pjId = String(pjId);
+  const t = TABLES[key];
+  if (!t) throw new Error('不明な表です：' + key);
+  const me = check_(token, pjId, t.page).me;
+  removeMany_(t.sheet, (ids || []).slice(0, 1000), me, pjId, t.label);
+  return {
+    key: key, ver: ver_(pjId),
+    rows: key === 'atk' ? attacksWithOthers_(pjId, readTable_('プロジェクト')) : rowsFor_(key, pjId),
+    at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss')
+  };
+}
+
+/** どの表でも使う保存（item.id が空なら追加） */
+function saveRow(token, pjId, key, item, force) {
+  pjId = String(pjId);
+  const t = TABLES[key];
+  if (!t) throw new Error('不明な表です：' + key);
+  const me = check_(token, pjId, t.page).me;
+  item = item || {};
+  const obj = { 'PJ ID': pjId };
+  Object.keys(t.fields).forEach(function (k) {
+    if (!(k in item) || (t.readonly || []).indexOf(k) >= 0) return;
+    let v = item[k];
+    if ((t.nums || []).indexOf(k) >= 0) v = (v === '' || v === null) ? '' : Math.max(0, Math.round(Number(v) || 0));
+    else if ((t.bools || []).indexOf(k) >= 0) v = (v === true || String(v).toUpperCase() === 'TRUE') ? 'TRUE' : 'FALSE';
+    else if ((t.times || []).indexOf(k) >= 0) v = timeCell_(v);
+    else if ((t.dates || []).indexOf(k) >= 0) v = dateStr_(v);
+    else v = String(v === null || v === undefined ? '' : v);
+    obj[t.fields[k]] = v;
+  });
+  if (t.stamp) { obj['更新者'] = me.email; obj['更新日時'] = new Date(); }
+  if (key === 'doc') obj['最終更新'] = today_();
+  if (key === 'todo' && ('ステータス' in obj) && obj['ステータス'] && TODO_STATUS.indexOf(obj['ステータス']) < 0) throw new Error('ステータスの値が正しくありません。');
+  if (!item.id) {
+    if (key === 'atk') {
+      const name = String(obj['相手'] || '').trim();
+      if (!name) throw new Error('相手の名前を入力してください。');
+      obj['相手'] = name;
+      if (!force) { const dup = findDup_(name, pjId); if (dup.length) return { dup: { name: name, hits: dup } }; }
+    }
+    if (t.onAdd) t.onAdd(obj, me, pjId);
+  }
+  upsert_(t.sheet, item.id || '', obj, t.prefix, me, pjId);
+  return getProject(token, pjId, [key]);
+}
+function findDup_(name, pjId) {
+  const names = pjNames_(readTable_('プロジェクト'));
+  const key = normName_(name);
+  return readTableSafe_('アタック').filter(function (a) {
+    const k = normName_(a['相手']);
+    return k && (k === key || (key.length >= 3 && (k.indexOf(key) >= 0 || key.indexOf(k) >= 0)));
+  }).map(function (a) {
+    return { same: String(a['PJ ID']) === pjId, pjName: names[String(a['PJ ID'])] || String(a['PJ ID']), name: String(a['相手']), who: String(a['担当'] || ''), status: String(a['ステータス'] || '') };
+  });
+}
+
+/** どの表でも使う削除 */
+function deleteRow(token, pjId, key, id) {
+  pjId = String(pjId);
+  const t = TABLES[key];
+  if (!t) throw new Error('不明な表です：' + key);
+  const me = check_(token, pjId, t.page).me;
+  remove_(t.sheet, id, me, pjId, t.label);
+  return getProject(token, pjId, [key]);
+}
+
+/** タイムテーブルの見た目と列を保存 */
+function saveTTConfig(token, pjId, cfg, cols) {
+  pjId = String(pjId);
+  const me = check_(token, pjId, 'タイムテーブル').me;
+  cfg = cfg || {};
+  replaceRows_('タイテ設定', pjId, [{
+    'タイトル': String(cfg.title || ''), 'ページ番号': String(cfg.page || ''),
+    '開始時刻': timeCell_(cfg.start), '終了時刻': timeCell_(cfg.end),
+    '1時間の高さ': Number(cfg.hourH) || 56, '基本の文字サイズ': Number(cfg.font) || 10
+  }], me);
+  replaceRows_('タイテ列', pjId, (cols || []).map(function (c, i) {
+    return { '順番': i + 1, '列名': String(c.name || ''), 'グループ': String(c.group || ''), '幅': Math.max(30, Number(c.w) || 80) };
+  }), me);
+  return getProject(token, pjId, ['ttcfg']);
+}
+
+/* ---------- ログイン不要の受付リンク ---------- */
+function shareCreate(token, pjId, days) {
+  pjId = String(pjId);
+  const me = check_(token, pjId, 'メンバー表').me;
+  const key = Utilities.getUuid().replace(/-/g, '').slice(0, 24);
+  replaceRows_('共有リンク', pjId, [{ '合言葉': key, '有効期限': addDays_(Math.max(1, Number(days) || 1)), '有効／停止': '有効' }], me);
+  return getProject(token, pjId, ['share']);
+}
+function shareStop(token, pjId) {
+  pjId = String(pjId);
+  const me = check_(token, pjId, 'メンバー表').me;
+  const s = shareInfo_(pjId);
+  if (s) replaceRows_('共有リンク', pjId, [{ '合言葉': s.key, '有効期限': s.exp, '有効／停止': '停止' }], me);
+  return getProject(token, pjId, ['share']);
+}
+function guestPj_(key) {
+  key = String(key || '');
+  const r = key && readTableSafe_('共有リンク').filter(function (x) { return String(x['合言葉']) === key; })[0];
+  if (!r || r['有効／停止'] !== '有効') throw new Error('このリンクは使えません。停止されたか、まちがったリンクです。');
+  const n = daysLeft_(r['有効期限']);
+  if (n !== null && n < 0) throw new Error('このリンクは有効期限が切れています。');
+  return String(r['PJ ID']);
+}
+function guestGet(key) {
+  const pjId = guestPj_(key);
+  const p = readTable_('プロジェクト').find(function (x) { return String(x['PJ ID']) === pjId; }) || {};
+  return {
+    project: { name: String(p['名前'] || ''), date: dateStr_(p['本番日']), target: Number(p['集客目標']) || 0 },
+    guests: rowsFor_('guest', pjId), choices: { '参加状況': getChoices_()['参加状況'] },
+    today: today_(), at: Utilities.formatDate(new Date(), tz_(), 'HH:mm:ss')
+  };
+}
+/** 受付リンクからの保存：参加状況・受付だけ変更できる。追加は氏名・大学・学年 */
+function guestSave(key, item) {
+  const pjId = guestPj_(key);
+  const me = { email: '受付リンク' };
+  item = item || {};
+  const obj = { 'PJ ID': pjId };
+  if (item.id) {
+    if ('status' in item) obj['参加状況'] = String(item.status || '');
+    if ('recv' in item) obj['受付'] = item.recv ? '済' : '';
+  } else {
+    const name = String(item.name || '').trim();
+    if (!name) throw new Error('氏名を入力してください。');
+    obj['氏名'] = name; obj['大学'] = String(item.univ || ''); obj['学年'] = String(item.grade || '');
+    obj['参加状況'] = '参加'; obj['受付'] = '済'; obj['追加元'] = '当日追加';
+  }
+  upsert_('当日参加者', item.id || '', obj, 'G', me, pjId);
+  return guestGet(key);
+}
+
+/* ---------- Googleフォームの取り込み ---------- */
+const FORM_COL = { guest: '参加者申込フォームの回答シートURL', staff: '運営メンバー申込フォームの回答シートURL', survey: 'アンケートフォームの回答シートURL' };
+/**
+ * フォームの回答を「1行目＝見出し、2行目から回答」の表として読む。
+ * ・Googleフォームの編集画面のURL（…/forms/d/…/edit）→ Y-PUがそのフォームの編集者なら読める
+ * ・回答シート（スプレッドシート）のURL → Y-PUがそのシートを見られれば読める
+ */
+function formValues_(url) {
+  url = String(url || '').trim();
+  if (/forms\.gle\/|\/forms\/d\/e\//.test(url)) {
+    throw new Error('これは回答する人に送るURLです。フォームの編集画面のURL（docs.google.com/forms/d/…/edit）を貼ってください。');
+  }
+  if (/\/forms\//.test(url)) {
+    let f;
+    try { f = FormApp.openByUrl(url); }
+    catch (e) { throw new Error('フォームを開けませんでした。Y-PUのアカウントがこのフォームの「編集者」になっているか確認してください。'); }
+    const skip = [FormApp.ItemType.SECTION_HEADER, FormApp.ItemType.PAGE_BREAK, FormApp.ItemType.IMAGE, FormApp.ItemType.VIDEO];
+    const items = f.getItems().filter(function (it) { return skip.indexOf(it.getType()) < 0; });
+    const head = ['タイムスタンプ'].concat(items.map(function (it) { return it.getTitle(); }));
+    const flat = function (v) { return Array.isArray(v) ? v.map(flat).filter(String).join(', ') : String(v === null || v === undefined ? '' : v); };
+    const rows = f.getResponses().map(function (r) {
+      const byId = {};
+      r.getItemResponses().forEach(function (ir) { byId[ir.getItem().getId()] = flat(ir.getResponse()); });
+      return [Utilities.formatDate(r.getTimestamp(), tz_(), 'yyyy-MM-dd HH:mm')].concat(items.map(function (it) { return byId[it.getId()] || ''; }));
+    });
+    return [head].concat(rows);
+  }
+  let book;
+  try { book = SpreadsheetApp.openByUrl(url); }
+  catch (e) { throw new Error('回答シートを開けませんでした。URLと、Y-PUのアカウントがそのスプレッドシートを見られるかを確認してください。'); }
+  const gid = (url.match(/[#&?]gid=(\d+)/) || [])[1];
+  const sheets = book.getSheets();
+  const sh = (gid && sheets.filter(function (x) { return String(x.getSheetId()) === gid; })[0]) ||
+    sheets.filter(function (x) { return /回答|Responses/i.test(x.getName()); })[0] || sheets[0];
+  return sh.getDataRange().getDisplayValues();
+}
+function importFromSheet_(url, key, pjId, me) {
+  const v = formValues_(url);
+  if (v.length < 2) return 0;
+  const head = v[0].map(function (h) { return String(h).trim(); });
+  const find = function (re) { return head.findIndex(function (h) { return re.test(h); }); };
+  const ni = find(/氏名|お名前|名前/), ui = find(/大学|学校/), gi = find(/学年/), ti = find(/チーム|希望/);
+  if (ni < 0) throw new Error('フォームに「氏名」または「名前」という質問（列）が見つかりません。');
+  const seen = {};
+  rowsFor_(key, pjId).forEach(function (r) { seen[normName_(r.name)] = true; });
+  const objs = [];
+  for (let i = 1; i < v.length; i++) {
+    const name = String(v[i][ni] || '').trim();
+    if (!name || seen[normName_(name)]) continue;
+    seen[normName_(name)] = true;
+    const o = { 'PJ ID': pjId, '氏名': name, '大学': ui >= 0 ? v[i][ui] : '', '学年': gi >= 0 ? v[i][gi] : '' };
+    if (key === 'guest') { o['参加状況'] = '申込'; o['受付'] = ''; o['追加元'] = 'フォーム'; }
+    else { o['希望チーム'] = ti >= 0 ? v[i][ti] : ''; }
+    objs.push(o);
+  }
+  return appendMany_(TABLES[key].sheet, objs, TABLES[key].prefix, me, 'フォームから' + objs.length + '件を取り込み');
+}
+function importForm(token, pjId, which) {
+  pjId = String(pjId);
+  const key = which === 'staff' ? 'staff' : 'guest';
+  const me = check_(token, pjId, 'メンバー表').me;
+  const p = readTable_('プロジェクト').find(function (x) { return String(x['PJ ID']) === pjId; }) || {};
+  const url = String(p[FORM_COL[key]] || '').trim();
+  if (!url) throw new Error('フォームのURLがまだ登録されていません。「権限・連携」ページで登録してください。');
+  const n = importFromSheet_(url, key, pjId, me);
+  const out = getProject(token, pjId, ['guest', 'staff']);
+  out.imported = n;
+  return out;
+}
+/** 進行中の全プロジェクトのフォームを取り込む（メニュー・1時間ごとの自動実行から） */
+function syncAllForms() {
+  const me = { email: '自動取り込み' };
+  readTable_('プロジェクト').forEach(function (p) {
+    if (p['状態'] === '終了') return;
+    const pjId = String(p['PJ ID']);
+    ['guest', 'staff'].forEach(function (key) {
+      const url = String(p[FORM_COL[key]] || '').trim();
+      if (!url) return;
+      try { importFromSheet_(url, key, pjId, me); } catch (e) { Logger.log(pjId + ' ' + key + ': ' + e.message); }
+    });
+  });
+}
+
+/* ---------- アンケート分析 ---------- */
+function sheetData_(url) {
+  if (!url) return null;
+  const v = formValues_(url);
+  return { headers: v[0] || [], rows: v.slice(1, 3001).filter(function (r) { return r.some(String); }) };
+}
+function getForms(token, pjId) {
+  pjId = String(pjId);
+  check_(token, pjId, 'アンケート分析');
+  const p = readTable_('プロジェクト').find(function (x) { return String(x['PJ ID']) === pjId; }) || {};
+  const out = { guests: null, survey: null, errors: [] };
+  try { out.guests = sheetData_(String(p[FORM_COL.guest] || '').trim()); } catch (e) { out.errors.push('参加者申込フォーム：' + e.message); }
+  try { out.survey = sheetData_(String(p[FORM_COL.survey] || '').trim()); } catch (e) { out.errors.push('アンケートフォーム：' + e.message); }
+  return out;
+}
+
+/* ---------- 権限・連携（管理） ---------- */
+function admin_(token, pjId) { return check_(token, String(pjId), '権限・連携'); }
+function getAdmin(token, pjId) {
+  pjId = String(pjId);
+  admin_(token, pjId);
+  const p = readTable_('プロジェクト').find(function (x) { return String(x['PJ ID']) === pjId; }) || {};
+  return {
+    users: readTable_('ユーザー').map(function (u) { return { email: String(u['メールアドレス'] || ''), last: String(u['名字'] || ''), first: String(u['名前'] || ''), kind: String(u['区分'] || ''), active: String(u['有効／無効'] || '有効') }; }),
+    groups: readTable_('権限').map(function (g) { const pg = {}; PAGES.forEach(function (x) { pg[x] = String(g[x]).toUpperCase() === 'TRUE'; }); return { name: String(g['グループ名'] || ''), emails: String(g['メールアドレス'] || ''), pages: pg }; }),
+    members: readTable_('PJメンバー').filter(function (m) { return String(m['PJ ID']) === pjId; }).map(function (m) { return { email: String(m['メールアドレス'] || ''), role: String(m['役割'] || '') }; }),
+    project: {
+      name: String(p['名前'] || ''), client: String(p['クライアント'] || ''), kind: String(p['種別'] || ''), date: dateStr_(p['本番日']),
+      target: p['集客目標'] === '' ? '' : Number(p['集客目標']) || 0, state: String(p['状態'] || ''),
+      urlGuest: String(p[FORM_COL.guest] || ''), urlStaff: String(p[FORM_COL.staff] || ''), urlSurvey: String(p[FORM_COL.survey] || '')
+    },
+    tools: getTools_(), choices: getChoices_(), pages: PAGES,
+    autoImport: ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'syncAllForms'; })
+  };
+}
+function saveUser(token, pjId, u) {
+  const me = admin_(token, pjId).me;
+  const email = String(u.email || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('メールアドレスの形を確認してください。');
+  upsertBy_('ユーザー', { 'メールアドレス': email }, { 'メールアドレス': email, '名字': String(u.last || ''), '名前': String(u.first || ''), '区分': String(u.kind || 'メンバー'), '有効／無効': u.active === '無効' ? '無効' : '有効' }, me);
+  return getAdmin(token, pjId);
+}
+function saveGroup(token, pjId, g) {
+  const me = admin_(token, pjId).me;
+  const name = String(g.name || '').trim();
+  if (!name) throw new Error('グループ名を入力してください。');
+  const obj = { 'グループ名': name, 'メールアドレス': String(g.emails || '').split(/[\s,、]+/).filter(String).join(', ') };
+  PAGES.forEach(function (x) { obj[x] = (g.pages && g.pages[x]) ? 'TRUE' : 'FALSE'; });
+  obj['ホーム'] = 'TRUE';
+  upsertBy_('権限', { 'グループ名': g.oldName || name }, obj, me);
+  return getAdmin(token, pjId);
+}
+function deleteGroup(token, pjId, name) {
+  const me = admin_(token, pjId).me;
+  removeBy_('権限', { 'グループ名': name }, me);
+  return getAdmin(token, pjId);
+}
+function savePjMember(token, pjId, email, role) {
+  pjId = String(pjId);
+  const me = admin_(token, pjId).me;
+  email = String(email || '').trim().toLowerCase();
+  if (!findUser_(email)) throw new Error('先に「ユーザー」にこのメールアドレスを登録してください。');
+  upsertBy_('PJメンバー', { 'PJ ID': pjId, 'メールアドレス': email }, { 'PJ ID': pjId, 'メールアドレス': email, '役割': String(role || '') }, me);
+  return getAdmin(token, pjId);
+}
+function removePjMember(token, pjId, email) {
+  pjId = String(pjId);
+  const me = admin_(token, pjId).me;
+  removeBy_('PJメンバー', { 'PJ ID': pjId, 'メールアドレス': email }, me);
+  return getAdmin(token, pjId);
+}
+function projectObj_(info) {
+  return {
+    '名前': String(info.name || ''), 'クライアント': String(info.client || ''), '種別': String(info.kind || ''),
+    '本番日': String(info.date || ''), '集客目標': info.target === '' || info.target === undefined ? '' : Math.max(0, Number(info.target) || 0),
+    '状態': String(info.state || '進行中'),
+    '参加者申込フォームの回答シートURL': String(info.urlGuest || ''), '運営メンバー申込フォームの回答シートURL': String(info.urlStaff || ''),
+    'アンケートフォームの回答シートURL': String(info.urlSurvey || '')
+  };
+}
+function saveProjectInfo(token, pjId, info) {
+  pjId = String(pjId);
+  const me = admin_(token, pjId).me;
+  const obj = projectObj_(info || {}); obj['PJ ID'] = pjId;
+  upsertBy_('プロジェクト', { 'PJ ID': pjId }, obj, me);
+  return getAdmin(token, pjId);
+}
+function createProject(token, pjId, info) {
+  const me = admin_(token, pjId).me;
+  if (!String((info || {}).name || '').trim()) throw new Error('プロジェクト名を入力してください。');
+  const ids = readTable_('プロジェクト').map(function (p) { const m = String(p['PJ ID']).match(/(\d+)$/); return m ? Number(m[1]) : 0; });
+  const newId = 'PJ' + String((ids.length ? Math.max.apply(null, ids) : 0) + 1).padStart(3, '0');
+  const obj = projectObj_(info); obj['PJ ID'] = newId; if (!info.state) obj['状態'] = '準備中';
+  upsertBy_('プロジェクト', { 'PJ ID': newId }, obj, me);
+  upsertBy_('PJメンバー', { 'PJ ID': newId, 'メールアドレス': me.email }, { 'PJ ID': newId, 'メールアドレス': me.email, '役割': me.staff ? '社員（担当）' : 'PL' }, me);
+  return { newId: newId };
+}
+function saveTools(token, pjId, tools) {
+  admin_(token, pjId);
+  const t = {};
+  ['design', 'submit', 'drawing'].forEach(function (k) { t[k] = { name: String((tools[k] || {}).name || ''), url: String((tools[k] || {}).url || '') }; });
+  PropertiesService.getScriptProperties().setProperty('TOOLS', JSON.stringify(t));
+  return getAdmin(token, pjId);
+}
+function setAutoImport(token, pjId, on) {
+  admin_(token, pjId);
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'syncAllForms') ScriptApp.deleteTrigger(t); });
+  if (on) ScriptApp.newTrigger('syncAllForms').timeBased().everyHours(1).create();
+  return getAdmin(token, pjId);
+}
